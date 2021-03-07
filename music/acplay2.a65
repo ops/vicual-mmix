@@ -1,0 +1,547 @@
+; VIC-20 MUSIC PLAYER (vplay) version 6.1
+; (c) 2002-2009 Anders Carlsson [Zapac] <anders.carlsson@sfks.se>
+;
+; RECENT CHANGES
+; --------------
+; 2008-05-25 : Added functionality for tracks that shouldn't loop (disabled?)
+; 2009-03-22 : Added arpeggio and vibrato support
+; 2009-04-19 : Added setting portamento on the fly
+;
+; See "readme.txt" and "acplay2-mac.i" for more information and usage.
+
+#processor 6502
+
+; whether one or all four channels are processed on every frame
+FOURCHAN equ 1
+
+; whether run as standalone executable or part of demo/game application
+STANDALONE equ 0 ;1
+
+; whether started from Basic or a ROM (cartridge) image
+FROMBASIC equ 0	  ;1
+
+; whether song follows directly after play routine
+;INCSONG equ 0
+
+; timer function uses $A7-AA
+
+; zero-page addresses for music
+#if 0
+zblock		equ $fb	; 2 bytes
+ztrack		equ $fd	; 2 bytes
+#else
+zblock = 0	; 0 for don't use: 3 bytes longer each
+ztrack = 0	; 0 for don't use: 3 bytes longer each
+#endif
+
+; index in music data
+#if INCSONG == 0
+MUS		equ 5120   ; change this as required, see music data
+speed		equ MUS
+porta		equ MUS+1
+jump_to		equ MUS+5
+hitrack		equ MUS+9
+lotrack		equ MUS+13
+blist		equ MUS+17 ; maximum MUS+29
+#endif
+
+; bit patterns in data
+ptend		equ 15
+pbend		equ 7
+
+#seg main
+
+#if STANDALONE
+#include "../basic.i"
+#include "../timings-unified.i"
+
+#if FROMBASIC
+	basicline $1001,2000
+	jsr player_init
+	rts
+#else
+	org $A000
+	dc.w start
+	dc.w restore
+	dc.b "A0",$C3,$C2,$CD
+start:	jsr $fd8d
+	jsr $fd52
+	jsr $fdf9
+	jsr $e518
+
+;	jsr $e45b
+;	jsr $e3a4
+;	jsr $e404
+	jsr player_init
+	cli
+	jmp ($c000)
+;	jmp $e467
+restore:  jmp $fec7
+#endif
+#else
+	; call player_init and player_update from application
+	;org 5120 	; completely relocatable to other address
+#endif
+
+#if 1
+	; For VICUAL:
+	; MUSVEC = for fading out music before decompressing the next part
+	; MUSVEC+6 = player_update
+	; MUSVEC+9 = player_init
+MUSVEC	jsr player_update
+	jmp $eb15	;return from IRQ, contains bit $9124
+	jmp player_update
+#endif
+
+player_init
+	; call macro to set up timers depending on PAL/NTSC
+#if STANDALONE
+	cfgtimers
+#endif
+;	ldx	speed
+;	tax
+;	lda	PAL_FLAG
+;	beq	pal$
+;	inx
+; pal$:	stx	plspeed
+
+#if 0	; statically initialized
+          ldx #56	; 4 * 14 workspace data
+	lda #0
+clr$:	sta dur,x
+	dex
+	bpl clr$
+#endif
+
+	ldx	#3
+#if FOURCHAN==0
+	stx	channel
+#endif
+
+init2$:	lda #0
+	sta $900a,x		; (A) equals 0 == silence the voices
+;	sta	trackloc,x
+;	sta	arpeggio,x
+;	sta	vibrato,x
+;	sta	repti,x
+	jsr	track_read
+	jsr	block_read
+	dex
+	bpl	init2$
+
+#if 1	; POj: spread the CPU by starting 2 voices with 1-frame offset
+	inc dur+1
+	inc dur+3
+#endif
+
+#if 0
+; LOOK OUT! We set absolute volume which may damage upper nybble of $900e
+	lda	#7
+	sta	$900e
+#else
+	lda	$900e		; might be initalized elsewhere?
+	ora	#7		; medium volume to avoid distortion
+	sta	$900e
+#endif
+	; synchronize IRQ to raster rows $24 (PAL) or $17 (NTSC)
+#if STANDALONE
+	setirq $24,$17,0,player_update,TRUE
+#endif
+	rts
+
+tread:	ldy	trackloc,x
+#if ztrack	; I wish dasm had ifdef and ifndef or if defined()..
+	lda	(ztrack),y
+#else
+ptrack	lda	$1000,y
+#endif
+	inc	trackloc,x	; won't affect A or C
+	rts
+
+bread:	ldy	blockloc,x
+#if zblock
+	lda	(zblock),y
+#else
+pblock	lda $1000,y
+#endif
+	inc	blockloc,x
+	rts	
+
+; parameter in: X = track/channel (0-3)
+; loop until we've set block pointers
+track_read
+#if ztrack
+	lda	hitrack,x
+	sta	ztrack+1
+	lda	lotrack,x
+	sta	ztrack+0
+#else
+	lda	hitrack,x
+	sta	ptrack+2
+	lda	lotrack,x
+	sta	ptrack+1
+#endif
+	jsr	tread
+	pha
+	and	#$1f
+	asl
+	tay	
+	lda	blist+1,y	   ; for music compiled with MSB order = 0 (6502)
+	sta	block_hi,x
+	lda	blist,y
+	sta	block_lo,x
+	lda	#0
+	sta	blockloc,x
+	pla
+	lsr
+	lsr
+	lsr
+	lsr
+	lsr
+	cmp	#7
+	bne	trsp$
+	jsr	tread
+	pha
+	lsr
+	lsr
+	lsr
+	lsr
+	cmp	#ptend
+	beq	tend$
+tls$:	sta	repti,x
+	bne	trsp1$
+tend$:	lda	jump_to,x
+	bmi	tls$
+	sta	trackloc,x
+trsp1$:	pla
+trsp$:	and	#$0f
+	sta	transpose,x
+	rts
+
+; parameter in: X (channel 0-3)
+; outputs: A (note value)
+block_read
+#if zblock
+	lda	block_hi,x
+	sta	zblock+1
+	lda	block_lo,x
+	sta	zblock
+#else
+	lda	block_hi,x
+	sta	pblock+2
+	lda	block_lo,x
+	sta	pblock+1
+#endif
+blr2$:	jsr	bread
+	pha
+	and	#$1f
+	beq	play$
+	clc
+	adc	transpose,x
+play$:
+	sta	rawnote,x
+	pla
+	lsr
+	lsr
+	lsr
+	lsr
+	lsr
+	cmp 	#7
+	bne	cont2$	
+nread$:	jsr	bread
+	pha
+	asl
+	bcc   unvib$
+	pha
+	jsr   bread
+
+; We reuse the vibrato command to instead change portamento on the fly.
+;
+; This feature is currently only used in folk.sng and canon3.sng.
+; For other songs, the code segment may be disabled to save memory.
+
+#if 1
+	cmp   #192	 
+	bcc   setvib$
+	and   #63
+	sta   porta,x
+	bcs   plavib$
+#endif
+
+setvib$:	sta   vibrato,x
+plavib$:	pla
+unvib$:	asl
+	bcc   noarp$
+	pha
+	jsr   bread
+	sta   arpeggio,x
+	pla
+noarp$:	asl
+	bcc   cont$
+	dec   repti,x
+	bmi	br2$
+	lda	#0
+	sta	blockloc,x
+	beq	cont$
+br2$:	jsr	track_read
+
+cont$:	pla
+	and	#$1f
+cont2$:
+#if 0
+	tay			; duration
+	lda	#0
+	clc
+dadd$:	adc	speed	  ; was plspeed in pal/ntsc independent player
+ 	dey
+	bpl	dadd$
+	; 10 bytes - 9 cyc / duration step 9..224 max 3 lines!
+#else
+#if MUSSPEED < 2
+    err "MUSSPEED < 2 not supported";
+#endif
+#if MUSSPEED == 2
+	asl
+	adc #MUSSPEED
+	; 3 bytes, 4 cycles
+#endif
+#if MUSSPEED == 3
+	sta nn$+1
+	asl
+nn$	adc #0
+	adc #MUSSPEED
+	; 8 bytes, 10 cycles
+#endif
+#if MUSSPEED == 4
+	asl
+	asl
+	adc #MUSSPEED
+	; 4 bytes, 6 cycles
+#endif
+#if MUSSPEED == 5
+	sta nn$+1
+	asl
+	asl
+nn$	adc #0
+	adc #MUSSPEED
+	; 9 bytes, 12 cycles
+#endif
+#if MUSSPEED == 6
+	asl
+	sta nn$+1
+	asl
+nn$	adc #0
+	adc #MUSSPEED
+	; 9 bytes, 12 cycles
+#endif
+#if MUSSPEED == 7
+	; valid for speed = 7
+	sta nn$+1
+	asl
+	asl
+	asl
+	sec
+nn$	sbc #7
+	adc #MUSSPEED-1
+	; 11 bytes, 16 cycles
+#endif
+#if MUSSPEED == 8
+	asl
+	asl
+	asl
+	clc
+	adc #MUSSPEED
+	; 6 bytes, 10 cycles
+#endif
+#if MUSSPEED == 9
+	sta nn$+1
+	asl
+	asl
+	asl
+	clc
+nn$	adc #0
+	adc #MUSSPEED
+	; 8 bytes, 12 cycles
+#endif
+
+#if 0
+	; valid for speed = %0100, %0110, %1000
+	tay
+	iny
+	tya
+	asl
+	sta nn$+2
+	asl
+	ldy speed
+	cpy #4	    ; remove if speed = 0..2
+	beq stdur$
+	cpy #6	    ; dey if speed = 0..2
+	beq nn$
+	asl
+	bcc stdur$
+
+nn$	clc	    ; remove if speed = 0..2 ?
+	adc #0
+	; 25 bytes, 35-38 cycles (?)
+#endif
+
+#endif
+stdur$:	sta	dur,x
+
+	lda	vibrato,x
+	beq	novib$
+	ldy	rawnote,x
+	lda freqtable+1,y
+	sec
+	sbc freqtable,y
+	cmp #2	; intervals smaller than 2 should not be halved
+	bcc dv$
+	lsr	; divide by two
+
+	ldy vibrato,x
+	bpl dv$
+	cmp #2	; quarter vibrato, should be divided again
+	bcc dv$	; but only if something left to divide
+	lsr
+dv$:	sta vibtarget,x
+
+	lda vibrato,x
+	and #15
+	sta vibcnt,x	; counter
+
+novib$:	lda #0		; always start vibrato from the middle
+	sta vibpos,x
+	rts
+
+player_update
+
+#if STANDALONE
+	irqsync
+#endif
+
+#if FOURCHAN
+	ldx	#3
+#else
+	ldx	channel
+#endif
+	;          inc	$900f
+chloop:	lda	transpose,x		; new addition 2008-05-25
+	bmi	iu2
+	dec	dur,x
+ 	bne 	porta_test
+	jsr	block_read	; dur=0
+
+freq:	lda rawnote,x
+	beq setchan
+
+	lda   vibrato,x
+	beq   novib$
+	dec vibcnt,x
+	bne novib$
+
+	lda vibrato,x
+	and #15
+	sta vibcnt,x
+
+	lda vibtarget,x
+	cmp vibpos,x
+	beq newvib$
+
+	;up$
+	clc
+	tay
+	bmi down$
+	inc vibpos,x
+	bcc novib$
+down$:
+	dec vibpos,x
+	bcc novib$
+newvib$
+	eor #$ff
+	sta vibtarget,x
+
+novib$:
+	lda arpeggio,x	;load byte so loading it won't affect flags later
+	dec arpcnt,x	; 2->1, 1->0, 0->-1
+	bpl arp0$
+
+	lda #2
+	sta arpcnt,x
+	bne arp2$	; 2->1->0
+
+arp0$	bne arp1$
+	lsr			; arpcnt=0 -> hi arpeggio nybble
+	lsr
+arp2$	lsr
+	lsr
+arp1$	and #$0f
+	clc
+	adc rawnote,x	  ; get offset to arpeggio note
+	tay
+	lda freqtable,y
+	clc
+	adc vibpos,x
+	
+setchan:	sta	$900a,x
+iu2:	dex
+#if FOURCHAN
+	bpl	chloop
+#else
+	bpl	ch_ok$
+	ldx	#3
+ch_ok$:	stx	channel
+#endif
+chut$:
+        ;  dec   $900f
+#if STANDALONE
+	jmp	$eabf
+#else
+	rts
+#endif
+
+porta_test
+	lda	dur,x
+	cmp	porta,x
+	bcs	freq
+clrtone:	lda	#0
+	beq	setchan
+
+; Frequency table optimized for PAL VIC-20. Note values would be different
+; on NTSC VIC-20. Unfortunately emulation is not reliable enough.
+
+freqtable	.byte 0	
+		.byte 255,130,137,144,150,156,161,167,172,176,181,185
+  		.byte 189,193,196,199,202,205,208,211,213,216,218,220
+  		.byte 222,224,226,227,229,254
+
+#if INCSONG
+#include "tetrisgb.sng"
+#endif
+
+#if FROMBASIC == 0
+	;rorg 720
+#endif
+dur	.byte 0,0,0,0
+transpose	.byte 0,0,0,0
+repti	.byte 0,0,0,0
+trackloc	.byte 0,0,0,0
+blockloc	.byte 0,0,0,0
+block_lo	.byte 0,0,0,0
+block_hi	.byte 0,0,0,0
+arpeggio	.byte 0,0,0,0 ; arpeggio offsets ($00-$FF)
+vibrato 	.byte 0,0,0,0 ; active vibrato default depth + speed
+vibtarget	.byte 0,0,0,0 ; active vibrato target ($F9 .. $07)
+vibpos	.byte 0,0,0,0 ; active vibrato position ($F9 .. $07)
+arpcnt	.byte 0,0,0,0 ; arpeggio index (0-2)
+vibcnt	.byte 0,0,0,0 ; active vibrato speed counter (0-15)
+rawnote	.byte 0,0,0,0 ; offset of current note, used by arpeggio + vibrato
+
+; plspeed	.byte 0
+#if FOURCHAN == 0
+channel	.byte 0
+#endif
+
+#if FROMBASIC == 0
+	;rend
+	;align 4096
+#endif
